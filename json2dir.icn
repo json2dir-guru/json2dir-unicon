@@ -1,0 +1,262 @@
+# json2dir: create the directory tree a JSON document describes, in the current directory.
+# Implements RFC J2D-1 (https://github.com/kitsunoff/awesome-json2dir/blob/main/spec/rfc-json2dir.md).
+# Unicon built-ins only: the JSON parser is written with string scanning.
+
+procedure die(msg)
+   write(&errout, "json2dir: ", msg)
+   exit(1)
+end
+
+# --- input -----------------------------------------------------------------
+
+procedure read_all()
+   local s, chunk
+   s := ""
+   # reads() with a large count returns nothing in Unicon 13.2, so read in small chunks
+   while chunk := reads(&input, 4096) do s ||:= chunk
+   return s
+end
+
+# §3: strict UTF-8 (no overlongs, no surrogates, nothing above U+10FFFF).
+procedure valid_utf8(s)
+   local c, b, n, lo, hi
+   s ? {
+      while not pos(0) do {
+         tab(many(&ascii))
+         if pos(0) then break
+         c := ord(move(1))
+         n := 2; lo := 16r80; hi := 16rBF
+         if 16rC2 <= c <= 16rDF then n := 1
+         else if c = 16rE0 then lo := 16rA0
+         else if c = 16rED then hi := 16r9F
+         else if 16rE1 <= c <= 16rEF then &null
+         else if c = 16rF0 then { n := 3; lo := 16r90 }
+         else if 16rF1 <= c <= 16rF3 then n := 3
+         else if c = 16rF4 then { n := 3; hi := 16r8F }
+         else fail
+         b := ord(move(1)) | fail
+         lo <= b <= hi | fail
+         every 2 to n do {
+            b := ord(move(1)) | fail
+            16r80 <= b <= 16rBF | fail
+         }
+      }
+   }
+   return
+end
+
+# --- JSON parser (string scanning on the current subject) ------------------
+
+procedure ws()
+   tab(many(' \t\n\r'))
+   return
+end
+
+procedure bad(what)
+   die("invalid JSON at byte " || &pos || ": " || what)
+end
+
+procedure parse_value()
+   ws()
+   if ="{" then return parse_object()
+   if ="[" then return parse_array()
+   if ="\"" then return parse_string()
+   if any(&digits ++ '-') | match("true" | "false" | "null") then
+      die("numbers, booleans and null are not allowed")
+   bad("expected a value")
+end
+
+procedure parse_object()
+   local t, k
+   t := table()
+   ws()
+   if ="}" then return t
+   repeat {
+      ws()
+      ="\"" | bad("expected a member name")
+      k := parse_string()
+      ws()
+      =":" | bad("expected ':'")
+      t[k] := parse_value()      # duplicate names: the last one wins
+      ws()
+      if ="}" then return t
+      ="," | bad("expected ',' or '}'")
+   }
+end
+
+procedure parse_array()
+   local l
+   l := []
+   ws()
+   if ="]" then return l
+   repeat {
+      put(l, parse_value())
+      ws()
+      if ="]" then return l
+      ="," | bad("expected ',' or ']'")
+   }
+end
+
+procedure hex4()
+   local h
+   h := move(4) | bad("short \\u escape")
+   upto(~'0123456789abcdefABCDEF', h) & bad("bad \\u escape")
+   return integer("16r" || h)
+end
+
+procedure utf8(u)
+   if u < 16r80 then return char(u)
+   if u < 16r800 then return char(16rC0 + ishift(u, -6)) || char(16r80 + iand(u, 16r3F))
+   if u < 16r10000 then
+      return char(16rE0 + ishift(u, -12)) || char(16r80 + iand(ishift(u, -6), 16r3F)) ||
+             char(16r80 + iand(u, 16r3F))
+   return char(16rF0 + ishift(u, -18)) || char(16r80 + iand(ishift(u, -12), 16r3F)) ||
+          char(16r80 + iand(ishift(u, -6), 16r3F)) || char(16r80 + iand(u, 16r3F))
+end
+
+# Called after the opening quote; returns the decoded bytes.
+procedure parse_string()
+   static plain
+   local s, u, lo
+   initial plain := &cset -- '"\\' -- &cset[1:33]
+   s := ""
+   repeat {
+      s ||:= tab(many(plain))
+      if ="\"" then return s
+      if ="\\" then {
+         case move(1) of {
+            "\"": s ||:= "\""
+            "\\": s ||:= "\\"
+            "/":  s ||:= "/"
+            "b":  s ||:= "\b"
+            "f":  s ||:= "\f"
+            "n":  s ||:= "\n"
+            "r":  s ||:= "\r"
+            "t":  s ||:= "\t"
+            "u": {
+               u := hex4()
+               if 16rD800 <= u <= 16rDBFF then {
+                  (="\\u" & lo := hex4() & 16rDC00 <= lo <= 16rDFFF) |
+                     die("string contains an unpaired surrogate")
+                  u := 16r10000 + ishift(u - 16rD800, 10) + (lo - 16rDC00)
+               }
+               else if 16rDC00 <= u <= 16rDFFF then
+                  die("string contains an unpaired surrogate")
+               s ||:= utf8(u)
+            }
+            default: bad("bad escape")
+         }
+      }
+      else bad("unterminated string or control character")
+   }
+end
+
+procedure parse(text)
+   local root
+   text ? {
+      ="\xef\xbb\xbf"            # a leading BOM is ignored, as §3 allows
+      ws()
+      ="{" | die("the root of the document must be an object")
+      root := parse_object()
+      ws()
+      pos(0) | bad("trailing data")
+   }
+   return root
+end
+
+# --- validation (§4) -------------------------------------------------------
+
+procedure validate(v, where)
+   local k, child
+   case type(v) of {
+      "string": return
+      "list": {
+         (*v = 2 & type(v[1]) == "string" & type(v[2]) == "string") |
+            die(where || ": an array must be [\"link\", target] or [\"script\", content]")
+         v[1] == ("link" | "script") | die(where || ": unknown array kind " || image(v[1]))
+         (v[1] == "link" & find("\0", v[2])) & die(where || ": a link target cannot contain NUL")
+      }
+      "table": {
+         every k := key(v) do {
+            child := if where == "." then k else where || "/" || k
+            (k == ("" | "." | "..") | upto('/\0', k)) & die(child || ": invalid name " || image(k))
+            validate(v[k], child)
+         }
+      }
+      default: die(where || ": value not allowed")
+   }
+   return
+end
+
+# --- file system (§5) ------------------------------------------------------
+
+procedure is_dir(st)
+   return \st & st.mode[1] == "d"
+end
+
+# Remove an existing non-directory (a symlink itself, never its target).
+procedure clear(p, st)
+   \st | return
+   is_dir(st) & die(p || ": a directory is in the way")
+   remove(p) | die(p || ": cannot remove: " || &errortext)
+   return
+end
+
+procedure mode_bits(m)
+   local bits, i
+   bits := 0
+   every i := 2 to 10 do
+      bits := 2 * bits + (if m[i] == "-" then 0 else 1)
+   return bits
+end
+
+procedure write_file(p, content, executable)
+   local f
+   f := open(p, "wu") | die(p || ": cannot create: " || &errortext)
+   writes(f, content) | die(p || ": cannot write")
+   close(f)
+   if \executable then
+      chmod(p, ior(mode_bits(lstat(p).mode), 8r111)) | die(p || ": cannot chmod")
+   return
+end
+
+procedure apply(dir, t)
+   local pair, name, v, p, st
+   every pair := !sort(t, 1) do {      # ascending byte order of names
+      name := pair[1]
+      v := pair[2]
+      p := dir || "/" || name
+      st := lstat(p) | &null
+      case type(v) of {
+         "string": { clear(p, st); write_file(p, v) }
+         "list": {
+            clear(p, st)
+            if v[1] == "link" then
+               symlink(v[2], p) | die(p || ": cannot create link: " || &errortext)
+            else write_file(p, v[2], 1)
+         }
+         "table": {
+            if not is_dir(st) then {
+               if \st then remove(p) | die(p || ": cannot remove: " || &errortext)
+               mkdir(p) | die(p || ": cannot create directory: " || &errortext)
+            }
+            apply(p, v)
+         }
+      }
+   }
+   return
+end
+
+procedure main(args)
+   local text, root
+   if *args > 0 then {
+      write(&errout, "usage: json2dir < document.json")
+      exit(2)
+   }
+   text := read_all()
+   valid_utf8(text) | die("input is not valid UTF-8")
+   root := parse(text)
+   validate(root, ".")
+   apply(".", root)
+   exit(0)
+end
